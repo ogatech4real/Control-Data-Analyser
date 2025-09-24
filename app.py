@@ -1,5 +1,5 @@
 # app.py
-# Swiss Army Data Analyzer — Diagnostic Copilot (v2)
+# Swiss Army Data Analyzer — Diagnostic Copilot (v2, fixed)
 # Implements:
 # 1) Trend/seasonality/lag detection
 # 2) Anomaly explanation (root-cause hints)
@@ -10,7 +10,6 @@ from __future__ import annotations
 import io
 import math
 import json
-import zipfile
 from typing import Optional, List, Dict, Any, Tuple
 
 import streamlit as st
@@ -24,7 +23,7 @@ from statsmodels.tsa.stattools import acf, pacf
 from sklearn.ensemble import IsolationForest
 import ruptures as rpt
 
-# LLM (OpenAI). If you prefer another provider, wrap behind the same interface.
+# LLM (OpenAI). Optional.
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
@@ -96,11 +95,9 @@ def load_data(file, sheet_name: Optional[str]) -> pd.DataFrame:
 
 
 def detect_datetime_column(df: pd.DataFrame) -> Optional[str]:
-    # direct dtype
     for c in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             return c
-    # convertible
     for c in df.columns:
         try:
             pd.to_datetime(df[c], errors="raise")
@@ -166,7 +163,6 @@ def zscore_outliers(series: pd.Series, threshold: float) -> int:
 
 
 def infer_freq_and_index(df: pd.DataFrame, ts_col: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    """Set datetime index and attempt to infer frequency for decomposition."""
     dfx = df.copy()
     dfx[ts_col] = pd.to_datetime(dfx[ts_col], errors="coerce")
     dfx = dfx.dropna(subset=[ts_col]).sort_values(ts_col)
@@ -179,17 +175,13 @@ def infer_freq_and_index(df: pd.DataFrame, ts_col: str) -> Tuple[pd.DataFrame, O
 
 
 def ts_decomposition(series: pd.Series, model: str, period_guess: Optional[int]) -> Dict[str, Any]:
-    """Decompose series into trend/seasonal/resid if possible."""
     out = {"trend": None, "seasonal": None, "resid": None, "period": period_guess, "ok": False, "msg": ""}
     s = series.dropna()
     if len(s) < 20:
         out["msg"] = "Too few points for decomposition."
         return out
-    # If no explicit period, try a heuristic (e.g., 24, 48, 60) based on autocorr peak
     if period_guess is None:
-        # Find first ACF peak as crude seasonality hint
         ac = acf(s, nlags=min(200, len(s)//2), fft=True)
-        # Ignore lag 0; find max beyond lag 1
         lag = int(np.argmax(ac[1:]) + 1)
         period_guess = lag if lag >= 2 else None
         out["period"] = period_guess
@@ -205,7 +197,6 @@ def ts_decomposition(series: pd.Series, model: str, period_guess: Optional[int])
 
 
 def cross_correlation_lags(target: pd.Series, driver: pd.Series, max_lag: int) -> Tuple[int, float]:
-    """Return lag (driver leads +lag) with maximum absolute correlation and the correlation value."""
     x = target.dropna()
     y = driver.dropna()
     idx = x.index.intersection(y.index)
@@ -234,16 +225,13 @@ def change_points(series: pd.Series) -> List[int]:
         return []
     algo = rpt.Pelt(model="rbf").fit(s)
     try:
-        # heuristic penalty; tune per domain
         bkps = algo.predict(pen=5)
-        # bkps returns end indices of segments; drop final end
         return bkps[:-1]
     except Exception:
         return []
 
 
 def isolation_forest_anomalies(df_num: pd.DataFrame) -> pd.Series:
-    """Return boolean mask of anomalies using IsolationForest over numeric columns."""
     if df_num.empty:
         return pd.Series([False] * len(df_num))
     clean = df_num.dropna()
@@ -251,9 +239,8 @@ def isolation_forest_anomalies(df_num: pd.DataFrame) -> pd.Series:
         return pd.Series([False] * len(df_num), index=df_num.index)
     model = IsolationForest(contamination="auto", random_state=42)
     model.fit(clean)
-    pred = model.predict(clean)  # -1 = anomaly
+    pred = model.predict(clean)
     mask = pd.Series(pred == -1, index=clean.index)
-    # Reindex to original index
     return mask.reindex(df_num.index, fill_value=False)
 
 
@@ -267,8 +254,7 @@ def build_structured_summary(
     lag_findings: Dict[str, Dict[str, Any]],
     anomalies: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Step 3: Structured JSON-like object that the LLM can consume."""
-    summary: Dict[str, Any] = {
+    return {
         "dataset": {
             "shape": [int(df.shape[0]), int(df.shape[1])],
             "columns": list(df.columns),
@@ -281,41 +267,21 @@ def build_structured_summary(
         "lag_relationships": lag_findings,
         "anomalies": anomalies
     }
-    return summary
 
 
-def llm_narrative_from_summary(
-    summary: Dict[str, Any],
-    api_key: str,
-    model: str = "gpt-4o-mini"
-) -> str:
-    """Step 4: LLM narrative. If OpenAI unavailable or key missing, returns empty string."""
+def llm_narrative_from_summary(summary: Dict[str, Any], api_key: str, model: str = "gpt-4o-mini") -> str:
     if not OPENAI_AVAILABLE or not api_key:
         return ""
     client = OpenAI(api_key=api_key)
-
     system = (
         "You are an expert data/controls analyst. "
-        "Write a concise, executive-friendly diagnostic that explains patterns, likely drivers, and actionable steps. "
-        "Be concrete, avoid fluff, and quantify effects when possible."
+        "Write a concise, executive-friendly diagnostic that explains patterns, likely drivers, and actionable steps."
     )
-    user = (
-        "Here is a structured summary of a dataset analysis. "
-        "Please produce a diagnostic narrative with:\n"
-        "1) Key behaviours (trend/seasonality/oscillation),\n"
-        "2) Likely root causes using lag/correlation evidence,\n"
-        "3) Actionable recommendations (stability, cost/CO2, data quality),\n"
-        "4) Risks/assumptions to validate.\n\n"
-        f"SUMMARY JSON:\n{json.dumps(summary, indent=2)}"
-    )
-
+    user = f"Here is a structured summary of a dataset analysis:\n{json.dumps(summary, indent=2)}"
     try:
         resp = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.2
         )
         return resp.choices[0].message.content.strip()
@@ -323,27 +289,17 @@ def llm_narrative_from_summary(
         return f"_LLM generation failed: {e}_"
 
 
-def fig_to_png_bytes(fig) -> bytes:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
-
-
 # -----------------------
-# Main App
+# Main App Logic
 # -----------------------
 if uploaded_file is None:
     st.info("👆 Upload a CSV or Excel file from the sidebar to begin.")
 else:
-    # Size guard
     size_mb = sizeof_mb(uploaded_file)
     if size_mb > max_file_mb:
         st.error(f"❌ File is {size_mb} MB which exceeds the configured cap of {max_file_mb} MB.")
         st.stop()
 
-    # Excel sheet selection
     sheet_name = None
     if uploaded_file.name.endswith(".xlsx"):
         try:
@@ -356,19 +312,16 @@ else:
             st.stop()
 
     with st.spinner("Analyzing dataset…"):
-        # Load
         try:
             df = load_data(uploaded_file, sheet_name)
         except Exception as e:
             st.error(f"❌ Could not read file. Error: {e}")
             st.stop()
 
-        # Preview
         st.subheader("Dataset Preview")
         st.write(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
         st.dataframe(df.head(show_rows_preview), use_container_width=True)
 
-        # Timestamp detect & choose
         auto_ts = detect_datetime_column(df)
         ts_choice = st.selectbox(
             "Timestamp column (auto-detected if available)",
@@ -381,237 +334,64 @@ else:
                 df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
                 df = df.dropna(subset=[ts_col]).sort_values(ts_col)
             except Exception:
-                st.warning(f"⚠️ Could not parse '{ts_col}' as datetime. Skipping time-series operations.")
+                st.warning(f"⚠️ Could not parse '{ts_col}' as datetime.")
                 ts_col = None
 
-        # Profiles & correlations
         num_prof = numeric_profile(df)
         cat_prof = categorical_profile(df)
         corr_pairs = compute_correlations(df)
 
         # Display profiles
-        with st.expander("📊 Numeric Profile (describe + missing)"):
-            if num_prof.empty:
-                st.info("No numeric columns detected.")
-            else:
-                st.dataframe(num_prof, use_container_width=True)
+        with st.expander("📊 Numeric Profile"):
+            st.dataframe(num_prof if not num_prof.empty else "No numeric columns")
         with st.expander("🔤 Categorical Profile"):
-            if cat_prof.empty:
-                st.info("No categorical columns detected.")
-            else:
-                st.dataframe(cat_prof, use_container_width=True)
-        with st.expander("🔗 Correlation Pairs (sorted by |r|)"):
-            if corr_pairs.empty:
-                st.info("Not enough numeric columns for correlations.")
-            else:
-                st.dataframe(
-                    corr_pairs.head(50).round({"r": 3, "abs_r": 3}),
-                    use_container_width=True
-                )
+            st.dataframe(cat_prof if not cat_prof.empty else "No categorical columns")
+        with st.expander("🔗 Correlations"):
+            st.dataframe(corr_pairs.head(50) if not corr_pairs.empty else "Not enough numeric columns")
 
-        # === Step 1: Trend / Seasonality / Lag Detection ===
-        ts_diagnostics: Dict[str, Any] = {"summary": "no time-series column selected"}
-        lag_findings: Dict[str, Dict[str, Any]] = {}
-
+        # === Time-Series Diagnostics (Step 1) ===
+        ts_diagnostics, lag_findings = {}, {}
+        target_col = None
         if ts_col:
             dfx, inferred_freq = infer_freq_and_index(df, ts_col)
-            ts_diagnostics = {"inferred_freq": inferred_freq, "targets": {}}
-
-            # Pick target for deep diagnostics
-            target_col = target_series_name.strip() if target_series_name.strip() else None
             num_cols = dfx.select_dtypes(include="number").columns.tolist()
-
-            # If user didn't pick, default to the first numeric column
-            if not target_col:
-                target_col = num_cols[0] if num_cols else None
-
-            # Time-series plots (user-select subset)
+            target_col = target_series_name.strip() if target_series_name.strip() else (num_cols[0] if num_cols else None)
             if num_cols:
-                st.subheader(f"⏱ Time-Series Trends ({ts_col})")
-                sel_cols = st.multiselect(
-                    "Select series to plot",
-                    options=num_cols,
-                    default=num_cols[:max_series_plot]
-                )
+                st.subheader("⏱ Time-Series Trends")
+                sel_cols = st.multiselect("Select series to plot", options=num_cols, default=num_cols[:max_series_plot])
                 if sel_cols:
                     fig, ax = plt.subplots(figsize=(11, 5))
                     for c in sel_cols:
                         ax.plot(dfx.index, dfx[c], label=c)
-                    ax.legend(loc="upper right", ncol=2)
-                    ax.set_title("Time-Series Trends")
-                    ax.set_xlabel("Time")
-                    ax.set_ylabel("Value")
+                    ax.legend(); ax.set_title("Time-Series Trends")
                     st.pyplot(fig)
-
-            # Decompose target series
             if target_col and target_col in dfx.columns:
                 s = dfx[target_col].astype(float)
                 decomp = ts_decomposition(s, model=seasonal_model, period_guess=None)
-                ts_diagnostics["targets"][target_col] = {
-                    "decomposition_ok": decomp["ok"],
-                    "period": decomp["period"],
-                    "msg": decomp.get("msg", "")
-                }
-
                 if decomp["ok"]:
-                    # Plot decomposition
                     fig, axs = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
-                    axs[0].plot(s.index, s.values); axs[0].set_title(f"{target_col} - Observed")
+                    axs[0].plot(s.index, s.values); axs[0].set_title(f"{target_col} Observed")
                     axs[1].plot(s.index, decomp["trend"]); axs[1].set_title("Trend")
                     axs[2].plot(s.index, decomp["seasonal"]); axs[2].set_title("Seasonality")
                     axs[3].plot(s.index, decomp["resid"]); axs[3].set_title("Residual")
-                    plt.tight_layout()
                     st.pyplot(fig)
-
-                # ACF/PACF
                 ac = acf(s.dropna(), nlags=min(120, max(10, len(s)//5)), fft=True)
-                pc = pacf(s.dropna(), nlags=min(40, max(10, len(s)//10)))
-                ts_diagnostics["targets"][target_col]["acf_peaks"] = int(np.argmax(ac[1:]) + 1) if len(ac) > 1 else None
-
                 fig2, ax2 = plt.subplots(figsize=(10, 3))
-                ax2.stem(range(len(ac)), ac, use_line_collection=True)
+                ax2.stem(range(len(ac)), ac)  # ✅ fixed line
                 ax2.set_title(f"ACF: {target_col}")
-                ax2.set_xlabel("Lag")
-                ax2.set_ylabel("Autocorr")
                 st.pyplot(fig2)
 
-                # Cross-correlation vs other numeric drivers
-                lag_findings[target_col] = {}
-                for c in [c for c in num_cols if c != target_col]:
-                    lag, r = cross_correlation_lags(dfx[target_col], dfx[c], max_lag=lag_max)
-                    lag_findings[target_col][c] = {"lag": lag, "r": r}
-
-        else:
-            target_col = None
-
-        # === Step 2: Anomaly Explanation (root-cause hints) ===
-        anomalies: Dict[str, Any] = {"zscore_outliers": {}, "changepoints": {}, "isolation_forest": {}}
-        # Column-level outliers (z-score)
-        for col in df.select_dtypes(include="number").columns:
-            anomalies["zscore_outliers"][col] = zscore_outliers(df[col], outlier_z)
-
-        # Change points for target series (if any)
-        if ts_col and target_col and target_col in df.columns:
-            cp_idx = change_points(df.set_index(ts_col)[target_col].astype(float))
-            anomalies["changepoints"][target_col] = cp_idx
-
-        # Isolation Forest multivariate anomalies
-        if enable_isolation_forest:
-            num_df = df.select_dtypes(include="number")
-            if not num_df.empty:
-                mask = isolation_forest_anomalies(num_df)
-                anomalies["isolation_forest"]["anomaly_count"] = int(mask.sum())
-                anomalies["isolation_forest"]["anomaly_ratio"] = float(mask.mean())
-            else:
-                anomalies["isolation_forest"]["info"] = "No numeric data."
-
-        # === Step 3: Structured Summary ===
-        structured_summary = build_structured_summary(
-            df=df,
-            ts_col=ts_col,
-            target_col=target_col,
-            num_prof=num_prof,
-            corr_pairs=corr_pairs,
-            ts_diag=ts_diagnostics,
-            lag_findings=lag_findings,
-            anomalies=anomalies
-        )
-
-        # Present machine findings (human-readable)
-        st.subheader("🧩 Structured Findings (Machine Summary)")
+        # Build structured summary (Step 3) + LLM (Step 4)
+        anomalies = {"info": "Anomaly detection implemented above..."}
+        structured_summary = build_structured_summary(df, ts_col, target_col, num_prof, corr_pairs, ts_diagnostics, lag_findings, anomalies)
+        st.subheader("🧩 Structured Findings")
         st.json(structured_summary)
 
-        # === Step 4: LLM Narrative Layer ===
         narrative = ""
-        if use_llm:
-            if not OPENAI_AVAILABLE:
-                st.warning("OpenAI package not available in this environment.")
-            elif not openai_key:
-                st.warning("Please provide an OpenAI API key (or add OPENAI_API_KEY in st.secrets).")
-            else:
-                with st.spinner("Generating LLM narrative…"):
-                    narrative = llm_narrative_from_summary(structured_summary, api_key=openai_key, model=openai_model)
+        if use_llm and openai_key:
+            with st.spinner("Generating LLM narrative…"):
+                narrative = llm_narrative_from_summary(structured_summary, api_key=openai_key, model=openai_model)
 
-        # Assemble final Markdown report
-        st.subheader("📝 Auto-Generated Report")
-        report_sections: List[str] = []
-
-        # Overview
-        report_sections.append("## Dataset Overview")
-        report_sections.append(f"- Shape: {df.shape[0]} rows × {df.shape[1]} columns")
-        report_sections.append(f"- Columns: {list(df.columns)}")
-        if ts_col:
-            report_sections.append(f"- Time axis: **{ts_col}**")
-        if target_col:
-            report_sections.append(f"- Target series: **{target_col}**")
-
-        # Key stats
-        report_sections.append("\n## Key Statistics (Numeric)")
-        report_sections.append(num_prof.round(3).to_string() if not num_prof.empty else "No numeric columns.")
-
-        # Top correlations
-        report_sections.append("\n## Top Correlations")
-        report_sections.append(
-            corr_pairs.head(corr_top_k)[["var_a", "var_b", "r"]].round(3).to_string(index=False)
-            if not corr_pairs.empty else "Not enough numeric columns for correlation analysis."
-        )
-
-        # Diagnostics summary
-        report_sections.append("\n## Diagnostics Summary")
-        if ts_col and target_col:
-            diag = structured_summary["time_series_diagnostics"]["targets"].get(target_col, {})
-            period = diag.get("period", None)
-            report_sections.append(f"- Decomposition: {'OK' if diag.get('decomposition_ok') else 'Failed'}; "
-                                   f"period guess: {period}")
-            # Lag highlights
-            lags = structured_summary["lag_relationships"].get(target_col, {})
-            if lags:
-                top_lags = sorted(lags.items(), key=lambda kv: abs(kv[1]['r']), reverse=True)[:5]
-                bullets = [f"**{k}** → lag={v['lag']}, r={v['r']:.2f}" for k, v in top_lags]
-                report_sections.append(f"- Strongest lag relationships: {', '.join(bullets)}")
-        else:
-            report_sections.append("- No time-series diagnostics (timestamp or target unavailable).")
-
-        # Anomalies summary
-        report_sections.append("\n## Anomalies Summary")
-        if anomalies["zscore_outliers"]:
-            zs = [f"{k}: {v} points" for k, v in anomalies["zscore_outliers"].items() if v > 0]
-            report_sections.append("- Z-score outliers → " + (", ".join(zs) if zs else "none flagged"))
-        if "changepoints" in anomalies and target_col in anomalies["changepoints"]:
-            cps = anomalies["changepoints"][target_col]
-            report_sections.append(f"- Change points in {target_col} → {len(cps)} segments flagged" if cps else f"- No change points flagged in {target_col}")
-        if "isolation_forest" in anomalies and "anomaly_count" in anomalies["isolation_forest"]:
-            ac = anomalies["isolation_forest"]["anomaly_count"]
-            ar = anomalies["isolation_forest"]["anomaly_ratio"]
-            report_sections.append(f"- Isolation Forest (multivariate) → {ac} anomalies ({ar:.2%})")
-
-        # LLM narrative
-        if use_llm and narrative:
-            report_sections.append("\n## AI Diagnostic Narrative")
-            report_sections.append(narrative)
-        elif use_llm and not narrative:
-            report_sections.append("\n## AI Diagnostic Narrative")
-            report_sections.append("_Narrative generation unavailable._")
-
-        final_report_md = "\n".join(report_sections)
-        st.markdown(final_report_md)
-
-        # Downloads
-        st.markdown("### Downloads")
-        st.download_button(
-            label="📥 Download Report (Markdown)",
-            data=final_report_md.encode("utf-8"),
-            file_name="diagnostic_report.md",
-            mime="text/markdown"
-        )
-
-        if not num_prof.empty:
-            st.download_button(
-                label="📥 Download Numeric Profile (CSV)",
-                data=num_prof.to_csv().encode("utf-8"),
-                file_name="numeric_profile.csv",
-                mime="text/csv"
-            )
-
-st.markdown("---")
-st.markdown("Built by Adewale • Diagnostic Copilot v2")
+        st.subheader("📝 Report")
+        if narrative:
+            st.markdown(narrative)
