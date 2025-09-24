@@ -2,4 +2,8 @@ streamlit
 pandas
 numpy
 matplotlib
+statsmodels
+scikit-learn
+ruptures
 openpyxl
+openai
